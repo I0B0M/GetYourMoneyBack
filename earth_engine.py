@@ -1,86 +1,84 @@
-import os
 import ee
 import requests
-from datetime import datetime, timedelta
+from PIL import Image
+from io import BytesIO
+import os
 
-# Ensure authentication works correctly (Set the correct path)
-os.environ["EARTHENGINE_CREDENTIALS"] = "/Users/ibm/.config/earthengine/credentials"
+# PositionStack API key (replace with your actual key)
+API_KEY = '29e5b2182f173975fa9e719c401a3769'
 
-# Initialize Earth Engine API
-try:
-    ee.Initialize()
-    print("Google Earth Engine API initialized successfully!")
-except Exception as e:
-    print(f"Error initializing Earth Engine: {e}")
-    exit()
-
-# Miami coordinates (25°46'51"N, 80°13'43"W)
-lat = 25.78083
-lon = -80.22861
-
-# Slightly larger bounding box (approximately 200 meters)
-bbox = [lon - 0.001, lat - 0.001, lon + 0.001, lat + 0.001]
-
-# Function to fetch satellite image from Google Earth Engine
-def fetch_satellite_image(date, filename):
-    print(f"\nAttempting to fetch image for date: {date}")
+def get_naip_image_for_address(address, start_date='2022-01-01', end_date='2023-12-31', output_folder='results'):
+    """
+    Given a street address, geocode it with PositionStack, then fetch NAIP imagery
+    from Earth Engine and download the image locally.
     
-    # Define the area of interest (bounding box)
-    geometry = ee.Geometry.Rectangle(bbox)
-    
-    # Use Sentinel-2 imagery
-    image_collection = ee.ImageCollection("COPERNICUS/S2") \
-        .filterBounds(geometry) \
-        .filterDate(f"{date}T00:00:00", f"{date}T23:59:59") \
-        .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 30)) \
-        .sort('system:time_start', False)  # Sort by time to get the most recent image
+    Returns:
+        A tuple (filename, message) where filename is the path to the downloaded image
+        (or None if something went wrong), and message is a status string.
+    """
+    # 1. Geocode the address using PositionStack
+    url = f'https://api.positionstack.com/v1/forward?access_key={API_KEY}&query={address}'
+    response = requests.get(url)
 
-    # Get the first image (most recent within the date range)
-    image = image_collection.first()
-    
-    # Check if a valid image was found
-    if image.getInfo() is None:
-        print(f"No valid image found for {date}. Skipping...")
-        return False
+    if response.status_code != 200:
+        return None, f"Geocoding Error: {response.status_code}"
 
-    # Visualize the image in true color (RGB)
-    vis_params = {
-        'bands': ['B4', 'B3', 'B2'],  # Red, Green, Blue bands
-        'min': 0,
-        'max': 3000,
-    }
+    data = response.json()
+    if not data['data']:
+        return None, "Address not found by PositionStack."
 
+    latitude = data['data'][0]['latitude']
+    longitude = data['data'][0]['longitude']
+    if not latitude or not longitude:
+        return None, "Invalid coordinates from geocoding."
+
+    # 2. Initialize Earth Engine
     try:
-        # Get the URL for the image
-        url = image.getThumbURL(vis_params)
-        print(f"Image URL: {url}")
-
-        # Download the image
-        response = requests.get(url)
-        
-        if response.status_code == 200:
-            with open(filename, "wb") as file:
-                file.write(response.content)
-            print(f"Successfully saved image as {filename}")
-            return True
-        else:
-            print(f"Failed to retrieve image for {date}. Status code: {response.status_code}")
-            return False
+        ee.Initialize()
     except Exception as e:
-        print(f"Error fetching image for {date}: {e}")
-        return False
+        return None, f"Earth Engine initialization error: {e}"
 
-# Generate dates for the past week
-end_date = datetime.now()
-dates_to_try = [(end_date - timedelta(days=x)).strftime('%Y-%m-%d') for x in range(7)]
+    # 3. Define the geometry and load NAIP imagery
+    geometry = ee.Geometry.Point([longitude, latitude]).buffer(50)
+    image_collection = (ee.ImageCollection("USDA/NAIP/DOQQ")
+                        .filterBounds(geometry)
+                        .filterDate(start_date, end_date))
+    
+    size_info = image_collection.size().getInfo()
+    if size_info == 0:
+        return None, "No valid NAIP images found in that date range."
 
-print("Trying the following dates:", dates_to_try)
+    # 4. Get the first image
+    image = image_collection.first()
+    info = image.getInfo()
+    if info is None:
+        return None, "No valid NAIP image found for the specified date range."
 
-for date in dates_to_try:
-    success = fetch_satellite_image(date, f"miami_house_{date}.png")
-    if success:
-        print(f"Successfully retrieved image for {date}")
-        break
-    else:
-        print(f"Failed to retrieve image for {date}\n")
-        
+    # 5. Clip and get the thumbnail URL
+    image = image.clip(geometry)
+    vis_params = {
+        'bands': ['R', 'G', 'B'],
+        'min': 0,
+        'max': 255,
+        'scale': 1,  # NAIP ~1 m per pixel
+    }
+    thumb_url = image.getThumbURL(vis_params)
+    if not thumb_url:
+        return None, "Failed to get a thumbnail URL from Earth Engine."
+
+    # 6. Download the image
+    r = requests.get(thumb_url)
+    if r.status_code != 200:
+        return None, f"Failed to retrieve image from NAIP (status code {r.status_code})."
+
+    # 7. Save and optionally show
+    os.makedirs(output_folder, exist_ok=True)
+    filename = os.path.join(output_folder, f"naip_house_image_{start_date}_{end_date}.png")
+    with open(filename, "wb") as file:
+        file.write(r.content)
+
+    # Optionally load into PIL for further processing or display
+    # img = Image.open(BytesIO(r.content))
+    # img.show()
+
+    return filename, f"Successfully saved image as {filename}"
